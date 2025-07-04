@@ -23,7 +23,7 @@ from functools import lru_cache
 from hashlib import md5
 from posixpath import normpath
 from urllib.parse import urlparse, urlunparse
-from typing import Iterator, List, Optional, Dict, Set, Tuple
+from typing import Iterator, List, Optional, Dict, Set, Tuple, Any
 
 from bs4 import BeautifulSoup
 from bs4.element import Comment, Doctype, Tag
@@ -32,8 +32,15 @@ from tld.exceptions import TldBadUrl, TldDomainNotFound
 
 # Internal libraries
 from wapitiCore import parser_name
-from wapitiCore.net import Request, make_absolute
+from wapitiCore.net import Request, make_absolute, Response
 from wapitiCore.parsers.javascript import extract_js_redirections
+from playwright.async_api import async_playwright, PlaywrightPage, PlaywrightRoute, Error as PlaywrightError
+
+from wapitiCore.main.log import log_verbose, log_orange, log_blue
+
+def valid_xss_content_type(response: Response) -> bool: # Placeholder
+        ct = response.headers.get('content-type', '').lower()
+        return 'html' in ct or 'xhtml' in ct
 
 DISCONNECT_REGEX = r'(?i)((log|sign)\s?(out|off)|disconnect|déconnexion)'
 CONNECT_ERROR_REGEX = r'(invalid|'\
@@ -165,6 +172,87 @@ class Html:
                     base_path, "", "", ""
                 )
             )
+
+    @classmethod
+    async def from_response_with_js_rendering(
+        cls,
+        response_obj: Response,
+        url_for_context: str, # The URL context for JS execution and parsing
+        *,
+        execute_js: bool = False,
+        js_render_options: Optional[Dict[str, Any]] = None,
+        # Pass other Html __init__ params
+        encoding: Optional[str] = None,
+        allow_fragments: bool = False
+    ) -> 'Html':
+        """
+        Creates an Html instance from a WapitiResponse object, optionally rendering JavaScript.
+        """
+        final_html_to_parse = response_obj.text
+        
+        if execute_js and valid_xss_content_type(response_obj):
+            log_verbose(f"Html.from_response: Attempting JS rendering for {url_for_context}")
+            try:
+
+                options = js_render_options if js_render_options is not None else {}
+                playwright_headless = options.get("playwright_headless", True)
+                playwright_chromium_args = options.get(
+                    "playwright_chromium_args",
+                    ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu']
+                )
+                js_render_wait_ms = options.get("js_render_wait_ms", 2000)
+                playwright_goto_timeout = options.get("playwright_goto_timeout", 30000)
+                user_agent = options.get("user_agent", response_obj.headers.get("User-Agent", "Wapiti/Scanner"))
+
+
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(
+                        headless=playwright_headless,
+                        args=playwright_chromium_args
+                    )
+                    context = await browser.new_context(user_agent=user_agent)
+                    pw_page: PlaywrightPage = await context.new_page()
+
+                    _response_content_bytes = response_obj.content
+                    _response_headers = dict(response_obj.headers)
+                    _response_status = int(response_obj.status_code)
+
+                    # Ensure browser interprets content as HTML
+                    current_ct = _response_headers.get('content-type', 'text/html; charset=utf-8').lower()
+                    if not ('html' in current_ct or 'xml' in current_ct):
+                         _response_headers['content-type'] = 'text/html; charset=utf-8'
+                    
+                    async def route_handler(route: PlaywrightRoute):
+                        if route.request.url == url_for_context:
+                            await route.fulfill(
+                                status=_response_status,
+                                headers=_response_headers,
+                                body=_response_content_bytes
+                            )
+                        else:
+                            await route.continue_()
+                    
+                    await pw_page.route("**/*", route_handler)
+                    
+                    await pw_page.goto(url_for_context, waitUntil='domcontentloaded', timeout=playwright_goto_timeout)
+
+                    if js_render_wait_ms > 0:
+                        await pw_page.wait_for_timeout(js_render_wait_ms)
+                    
+                    final_html_to_parse = await pw_page.content()
+                    log_verbose(f"Html.from_response: Successfully rendered with JS: {url_for_context}")
+                    await browser.close()
+
+            except ImportError:
+                log_orange("Playwright not installed. Skipping JS rendering. (pip install playwright && playwright install chromium)")
+            except PlaywrightError as e:
+                log_orange(f"Playwright rendering error for {url_for_context} (PlaywrightError): {e}. Using original HTML.")
+            except Exception as e: # Catch other generic errors
+                log_orange(f"Generic error during Playwright rendering for {url_for_context} (Exception): {e}. Using original HTML.")
+        
+        # Determine encoding for the Html instance
+        resolved_encoding = encoding or response_obj.encoding or response_obj.apparent_encoding or "utf-8"
+        return cls(final_html_to_parse, url_for_context, encoding=resolved_encoding, allow_fragments=allow_fragments)
 
     @not_empty
     def _scripts(self) -> Iterator[str]:
